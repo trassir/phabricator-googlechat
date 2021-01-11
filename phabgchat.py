@@ -39,8 +39,8 @@ def parse_args():
 logger = getLogger(__name__)
 
 
-class PhabReciever(tw.RequestHandler):
-    def initialize(self, phab: Phabricator, hmac: str, gchat: str):
+class PhabGchat:
+    def __init__(self, phab: Phabricator, hmac: str, gchat: str):
         self.gchat = gchat
         self.hmac = hmac
         self.phab = phab
@@ -49,53 +49,35 @@ class PhabReciever(tw.RequestHandler):
             h = h[:-len('/api')]
         self.phab_host = h
 
-    def validate(self):
-        if not self.request.headers.get('Content-Type') == 'application/json':
+
+    def validate_request(self, body, headers):
+        if not headers.get('Content-Type') == 'application/json':
             m = 'not a json'
             logger.info(m)
-            self.set_status(400, m)
-            self.finish()
-            return False
+            return m
 
         if not self.hmac:
-            return True
+            return None
 
-        signature_sent = self.request.headers.get('X-Phabricator-Webhook-Signature')
+        signature_sent = headers.get('X-Phabricator-Webhook-Signature')
         if not signature_sent:
             m = 'no phabricator signature header'
             logger.info(m)
-            self.set_status(401, m)
-            self.finish()
-            return False
+            return m
 
         signature_calculated = hmac.new(
             self.hmac.encode(),
-            msg=self.request.body,
+            msg=body,
             digestmod=hashlib.sha256
         ).hexdigest()
 
         if signature_calculated != signature_sent:
             m = f'phabricator signature mismatch; in header: {signature_sent}, calculated: {signature_calculated}'
             logger.info(m)
-            self.set_status(401, m)
-            self.finish()
-            return False
+            return m
 
-        return True
+        return None
 
-    def post(self):
-        try:
-            logger.debug('POST!\nbody: %s\nheaders: %s', self.request.body, self.request.headers)
-            if not self.validate():
-                return
-
-            msg = json.loads(self.request.body)
-            self.process(msg)
-
-        except Exception as e:
-            logger.error(e)
-            self.set_status(500, f'Some internal server error: {e}')
-            self.finish()
 
     def process(self, j):
         o = j.get('object')
@@ -131,6 +113,27 @@ class PhabReciever(tw.RequestHandler):
         logger.info('DONE.')
 
 
+class PhabReciever(tw.RequestHandler):
+    def initialize(self, pg: PhabGchat):
+        self.interactor = pg
+
+    def post(self):
+        try:
+            logger.debug('POST!\nbody: %s\nheaders: %s', self.request.body, self.request.headers)
+            vmsg = self.interactor.validate_request(self.request.body, self.request.headers)
+            if vmsg:
+                self.set_status(400, vmsg)
+                return self.finish()
+
+            msg = json.loads(self.request.body)
+            self.interactor.process(msg)
+
+        except Exception as e:
+            logger.error(e)
+            self.set_status(500, f'Some internal server error: {e}')
+            self.finish()
+
+
 class TornadoServer(tw.Application):
     def __init__(self, port: int, handlers):
         super().__init__([
@@ -160,11 +163,11 @@ def main():
     phab.update_interfaces()
     logger.info(f'working with {phab.host}')
 
+    interactor = PhabGchat(phab, args.phabricator_hmac, args.gchat_webhook)
+
     ws = TornadoServer(int(args.port), [
         tw.url('/post', PhabReciever, dict(
-            phab=phab,
-            hmac=args.phabricator_hmac,
-            gchat=args.gchat_webhook,
+            pg=interactor,
         )),
     ])
     ws.run()

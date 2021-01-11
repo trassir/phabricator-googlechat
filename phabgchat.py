@@ -3,11 +3,12 @@
 import argparse
 import hashlib
 import hmac
-import json as j
+import json
 import os
 import logging
 from logging import getLogger
 
+from phabricator import Phabricator
 import tornado.web as tw
 import tornado.ioloop
 
@@ -25,7 +26,8 @@ def parse_args():
 
 
     p = argparse.ArgumentParser()
-    p.add_argument('--phabricator', action=EnvDefault, envvar='PHABGCHAT_PHABRICATOR_URL')
+    p.add_argument('--phabricator', action=EnvDefault, envvar='PHABGCHAT_PHABRICATOR_URL', required=False)
+    p.add_argument('--phabricator_token', action=EnvDefault, envvar='PHABGCHAT_PHABRICATOR_TOKEN', required=False)
     p.add_argument('--phabricator_hmac', action=EnvDefault, envvar='PHABGCHAT_PHABRICATOR_HMAC')
     p.add_argument('--gchat_webhook', action=EnvDefault, envvar='PHABGCHAT_GCHAT_WEBHOOK_URL')
     p.add_argument('--port', action=EnvDefault, envvar='PHABGCHAT_PORT', type=int)
@@ -37,44 +39,80 @@ logger = getLogger(__name__)
 
 
 class PhabReciever(tw.RequestHandler):
-    def initialize(self, phabricator, gchat, hmac):
-        self.phabricator = phabricator
+    def initialize(self, phab, hmac, gchat):
         self.gchat = gchat
         self.hmac = hmac
+        self.phab = phab
+
+    def validate(self):
+        if not self.request.headers.get('Content-Type') == 'application/json':
+            m = 'not a json'
+            logger.info(m)
+            self.set_status(400, m)
+            self.finish()
+            return False
+
+        if not self.hmac:
+            return True
+
+        signature_sent = self.request.headers.get('X-Phabricator-Webhook-Signature')
+        if not signature_sent:
+            m = 'no phabricator signature header'
+            logger.info(m)
+            self.set_status(401, m)
+            self.finish()
+            return False
+
+        signature_calculated = hmac.new(
+            self.hmac.encode(),
+            msg=self.request.body,
+            digestmod=hashlib.sha256
+        ).hexdigest()
+
+        if signature_calculated != signature_sent:
+            m = f'phabricator signature mismatch; in header: {signature_sent}, calculated: {signature_calculated}'
+            logger.info(m)
+            self.set_status(401, m)
+            self.finish()
+            return False
+
+        return True
 
     def post(self):
         try:
-            logger.info(f'look, a POST!\nbody: {self.request.body}\nheaders: {self.request.headers}')
+            logger.debug('POST!\nbody: %s\nheaders: %s', self.request.body, self.request.headers)
+            if not self.validate():
+                return
 
-            if not self.request.headers.get('Content-Type') == 'application/json':
-                m = 'not a json'
-                logger.info(m)
-                self.set_status(400, m)
-                return self.finish()
+            msg = json.loads(self.request.body)
+            self.process(msg)
 
-            if self.hmac:
-                signature_sent = self.request.headers.get('X-Phabricator-Webhook-Signature')
-                if not signature_sent:
-                    m = 'no phabricator signature'
-                    logger.info(m)
-                    self.set_status(401, m)
-                    return self.finish()
-                signature_calculated = hmac.new(
-                    self.hmac.encode(),
-                    msg=self.request.body,
-                    digestmod=hashlib.sha256
-                ).hexdigest()
-                if signature_calculated != signature_sent:
-                    m = f'phabricator signature mismatch; in header: {signature_sent}, calculated: {signature_calculated}'
-                    logger.info(m)
-                    self.set_status(401, m)
-                    return self.finish()
-            msg = j.loads(self.request.body)
-            logger.info(f'POST data enqueued as {j.dumps(msg,indent=2)}')
         except Exception as e:
             logger.error(e)
-            self.set_status(500)
-            self.finish(j.dumps(dict(error=f'Some internal server error: {e}')))
+            self.set_status(500, f'Some internal server error: {e}')
+            self.finish()
+
+    def process(self, j):
+        o = j.get('object')
+        if not o:
+            logger.error('no "object" key in json')
+            return
+        t = o.get('type')
+        if t != 'TASK':
+            logger.warning(f'can work only with object type TASK, got {t} instead')
+            return
+        p = o.get('phid')
+        logger.info(f'querying phabricator for task {p}')
+        query = self.phab.maniphest.search(constraints=dict(phids=[p])).data
+        if not query:
+            logger.error('no task found')
+            return
+        task = query[0]
+        task_id = task['id']
+        f = task['fields']
+        task_name = f['name']
+        logger.info(f'Task T{task_id}: {task_name}')
+
 
 
 class TornadoServer(tw.Application):
@@ -100,11 +138,17 @@ def main():
         fmt = '%(asctime)s - '+fmt
     logging.basicConfig(format=fmt, level=logging.INFO)
 
+
+    phab = Phabricator(host=args.phabricator, token=args.phabricator_token)
+    logger.info('updating phabricator interfaces...')
+    phab.update_interfaces()
+    logger.info(f'working with {phab.host}')
+
     ws = TornadoServer(int(args.port), [
         tw.url('/post', PhabReciever, dict(
-            phabricator=args.phabricator,
+            phab=phab,
+            hmac=args.phabricator_hmac,
             gchat=args.gchat_webhook,
-            hmac=args.phabricator_hmac
         )),
     ])
     ws.run()

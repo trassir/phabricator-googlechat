@@ -9,8 +9,9 @@ import logging
 from logging import getLogger
 
 from phabricator import Phabricator
-import tornado.web as tw
+import requests
 import tornado.ioloop
+import tornado.web as tw
 
 def parse_args():
     class EnvDefault(argparse.Action):
@@ -39,10 +40,14 @@ logger = getLogger(__name__)
 
 
 class PhabReciever(tw.RequestHandler):
-    def initialize(self, phab, hmac, gchat):
+    def initialize(self, phab: Phabricator, hmac: str, gchat: str):
         self.gchat = gchat
         self.hmac = hmac
         self.phab = phab
+        h = phab.host.rstrip('/')
+        if h.endswith('/api'):
+            h = h[:-len('/api')]
+        self.phab_host = h
 
     def validate(self):
         if not self.request.headers.get('Content-Type') == 'application/json':
@@ -108,11 +113,22 @@ class PhabReciever(tw.RequestHandler):
             logger.error('no task found')
             return
         task = query[0]
+
         task_id = task['id']
         f = task['fields']
         task_name = f['name']
-        logger.info(f'Task T{task_id}: {task_name}')
 
+        a = f['authorPHID']
+        logger.info(f'querying phabricator for user {a}')
+        u = self.phab.user.search(constraints=dict(phids=[a])).data[0]
+        username = u['fields']['realName']
+
+        msg = f'Ticket <{self.phab_host}/T{task_id}|T{task_id}> reported by {username}: ```{task_name}```'
+        logger.info(f'{msg}\nSending to google chat...')
+
+        headers = {'Content-Type': 'application/json; charset=UTF-8'}
+        requests.post(self.gchat, headers=headers, json=dict(text=msg))
+        logger.info('DONE.')
 
 
 class TornadoServer(tw.Application):

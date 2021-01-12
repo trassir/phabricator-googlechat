@@ -27,13 +27,24 @@ def parse_args():
 
 
     p = argparse.ArgumentParser()
-    p.add_argument('--phabricator', action=EnvDefault, envvar='PHABGCHAT_PHABRICATOR_URL', required=False)
-    p.add_argument('--phabricator_token', action=EnvDefault, envvar='PHABGCHAT_PHABRICATOR_TOKEN', required=False)
-    p.add_argument('--phabricator_hmac', action=EnvDefault, envvar='PHABGCHAT_PHABRICATOR_HMAC')
-    p.add_argument('--gchat_webhook', action=EnvDefault, envvar='PHABGCHAT_GCHAT_WEBHOOK_URL')
-    p.add_argument('--port', action=EnvDefault, envvar='PHABGCHAT_PORT', type=int)
-    p.add_argument('--log-notime', action='store_true')
-    return p.parse_args()
+    p.add_argument('--phabricator', action=EnvDefault, envvar='PHABGCHAT_PHABRICATOR_URL', required=False,
+        help='Phabricator API url. Example: https://phabricator.com/api/ .\n'
+        'If not specified, will be taken from your .arcrc defaults')
+    p.add_argument('--phabricator_token', action=EnvDefault, envvar='PHABGCHAT_PHABRICATOR_TOKEN', required=False,
+        help='Phabricator user token. Example: api-abc123def .\n'
+        'If not specified, will be taken from your .arcrc defaults')
+    p.add_argument('--phabricator_hmac', action=EnvDefault, envvar='PHABGCHAT_PHABRICATOR_HMAC',
+        help='Phabricator Webhook HMAC key. Example: fesacb123')
+    p.add_argument('--gchat_webhook', action=EnvDefault, envvar='PHABGCHAT_GCHAT_WEBHOOK_URL',
+        help='Google Chat room webhook. Example: https://chat.googleapis.com/v1/spaces/aaa/messages?key=bbb&token=ccc')
+    p.add_argument('--port', action=EnvDefault, envvar='PHABGCHAT_PORT', type=int,
+        help='port to listen for Phabricator POSTs')
+    p.add_argument('--log-notime', action='store_true',
+        help='do not print timestamps to log')
+    a = p.parse_args()
+    if a.phabricator and not a.phabricator.endswith('/api/'):
+        p.error('Phabricator API url should end with `/api/` (note the slash) for Conduit to work')
+    return a
 
 
 logger = getLogger(__name__)

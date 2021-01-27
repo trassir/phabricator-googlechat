@@ -1,9 +1,0 @@
-version: "2"
-  
-services:
-  phabchat:
-    build: .
-    ports:
-      - "9999:9999"
-    env_file:
-      - /root/docker_env/phabchat.env

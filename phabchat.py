@@ -7,31 +7,33 @@ import json
 import os
 import logging
 from logging import getLogger
+from typing import Any, Optional
 
 from phabricator import Phabricator
 import requests
+from tornado.httputil import HTTPHeaders
 import tornado.ioloop
 import tornado.web as tw
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     class EnvDefault(argparse.Action):
-        def __init__(self, envvar, required=True, default=None, **kwargs):
+        def __init__(self, envvar: str, required: bool=True, default: Any=None, **kwargs: Any):
             if envvar in os.environ:
                 default = os.environ[envvar]
             if required and default:
                 required = False
             super().__init__(default=default, required=required, **kwargs)
 
-        def __call__(self, parser, namespace, values, option_string=None):
+        def __call__(self, parser: Any, namespace: Any, values: Any, option_string: Any=None) -> None:
             setattr(namespace, self.dest, values)
 
 
     p = argparse.ArgumentParser()
-    p.add_argument('--phabricator', action=EnvDefault, envvar='PHABGCHAT_PHABRICATOR_URL', required=False)
-    p.add_argument('--phabricator_token', action=EnvDefault, envvar='PHABGCHAT_PHABRICATOR_TOKEN', required=False)
-    p.add_argument('--phabricator_hmac', action=EnvDefault, envvar='PHABGCHAT_PHABRICATOR_HMAC')
-    p.add_argument('--gchat_webhook', action=EnvDefault, envvar='PHABGCHAT_GCHAT_WEBHOOK_URL')
-    p.add_argument('--port', action=EnvDefault, envvar='PHABGCHAT_PORT', type=int)
+    p.add_argument('--phabricator', action=EnvDefault, envvar='PHABCHAT_PHABRICATOR_URL', required=False)
+    p.add_argument('--phabricator_token', action=EnvDefault, envvar='PHABCHAT_PHABRICATOR_TOKEN', required=False)
+    p.add_argument('--phabricator_hmac', action=EnvDefault, envvar='PHABCHAT_PHABRICATOR_HMAC')
+    p.add_argument('--teams_webhook', action=EnvDefault, envvar='PHABCHAT_TEAMS_WEBHOOK_URL')
+    p.add_argument('--port', action=EnvDefault, envvar='PHABCHAT_PORT', type=int)
     p.add_argument('--log-notime', action='store_true')
     return p.parse_args()
 
@@ -39,9 +41,9 @@ def parse_args():
 logger = getLogger(__name__)
 
 
-class PhabGchat:
-    def __init__(self, phab: Phabricator, hmac: str, gchat: str):
-        self.gchat = gchat
+class PhabChat:
+    def __init__(self, phab: Phabricator, hmac: str, teams_url: str):
+        self.teams_url = teams_url
         self.hmac = hmac
         self.phab = phab
         h = phab.host.rstrip('/')
@@ -50,7 +52,7 @@ class PhabGchat:
         self.phab_host = h
 
 
-    def validate_request(self, body, headers):
+    def validate_request(self, body: bytes, headers: HTTPHeaders) -> Optional[str]:
         if not headers.get('Content-Type') == 'application/json':
             m = 'not a json'
             logger.info(m)
@@ -79,7 +81,7 @@ class PhabGchat:
         return None
 
 
-    def process(self, j):
+    def process(self, j: dict[str, Any]) -> None:
         o = j.get('object')
         if not o:
             logger.error('no "object" key in json')
@@ -105,25 +107,56 @@ class PhabGchat:
         u = self.phab.user.search(constraints=dict(phids=[a])).data[0]
         username = u['fields']['realName']
 
-        msg = f'Ticket <{self.phab_host}/T{task_id}|T{task_id}> reported by {username}: ```{task_name}```'
-        logger.info(f'{msg}\nSending to google chat...')
+        self.send(task_name, task_id, username)
 
-        headers = {'Content-Type': 'application/json; charset=UTF-8'}
-        requests.post(self.gchat, headers=headers, json=dict(text=msg))
+
+    def send(self, task_name: str, task_id: int, username: str) -> None:
+        T = f'T{task_id}'
+        url = f'{self.phab_host}/{T}'
+        payload = {
+            "@type": "MessageCard",
+            "@context": "http://schema.org/extensions",
+            "themeColor": "4a5f88",
+            "summary": "n/a",
+            "sections": [{
+                "activityTitle": f"{T}: {task_name}",
+                "facts": [
+                    {
+                        "name": "Reported by:",
+                        "value": username
+                    },
+                    {
+                        "name": "URL:",
+                        "value": url
+                    }
+                ],
+            }],
+            "potentialAction": [{
+                "@type": "OpenUri",
+                "name": "Open",
+                "targets": [{
+                    "os": "default",
+                    "uri": url
+                }]
+            }]
+        }
+        logger.info(f'Sending to microsoft teams:\n{payload}')
+        requests.post(self.teams_url, json=payload)
         logger.info('DONE.')
 
 
 class PhabReciever(tw.RequestHandler):
-    def initialize(self, pg: PhabGchat):
+    def initialize(self, pg: PhabChat) -> None:
         self.interactor = pg
 
-    def post(self):
+    def post(self) -> None:
         try:
             logger.debug('POST!\nbody: %s\nheaders: %s', self.request.body, self.request.headers)
             vmsg = self.interactor.validate_request(self.request.body, self.request.headers)
             if vmsg:
                 self.set_status(400, vmsg)
-                return self.finish()
+                self.finish()
+                return
 
             msg = json.loads(self.request.body)
             self.interactor.process(msg)
@@ -135,7 +168,7 @@ class PhabReciever(tw.RequestHandler):
 
 
 class TornadoServer(tw.Application):
-    def __init__(self, port: int, handlers):
+    def __init__(self, port: int, handlers: Any):
         super().__init__([
             tw.url('/', tw.RequestHandler),
             *handlers
@@ -143,13 +176,13 @@ class TornadoServer(tw.Application):
         self.port = port
         logger.info(f'Tornado app created @ port {self.port}')
 
-    def run(self):
+    def run(self) -> None:
         self.listen(self.port)
         logger.info('Tornado serving forever')
         tornado.ioloop.IOLoop.instance().start()
 
 
-def main():
+def main() -> None:
     args = parse_args()
 
     fmt = '%(name)s - %(levelname)s - %(message)s'
@@ -163,7 +196,7 @@ def main():
     phab.update_interfaces()
     logger.info(f'working with {phab.host}')
 
-    interactor = PhabGchat(phab, args.phabricator_hmac, args.gchat_webhook)
+    interactor = PhabChat(phab, args.phabricator_hmac, args.teams_webhook)
 
     ws = TornadoServer(int(args.port), [
         tw.url('/post', PhabReciever, dict(
